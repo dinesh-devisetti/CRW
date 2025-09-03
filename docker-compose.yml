@@ -29,6 +29,7 @@ services:
       - "4000:4000"
     environment:
       - DATABASE_URL=postgres://user:password@db:5432/crw_db
+      - REDIS_URL=redis://redis:6379
       - JWT_SECRET=changeme
       - PORT=4000
       - NODE_ENV=production
@@ -36,8 +37,11 @@ services:
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=crw_db
       - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     depends_on:
       - db
+      - redis
     volumes:
       - ./backend:/app
       - /app/node_modules
@@ -77,5 +81,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   db_data:
+  redis_data:
