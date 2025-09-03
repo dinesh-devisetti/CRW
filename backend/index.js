@@ -7,6 +7,7 @@ const { connectRedis, redisUtils } = require('./redis');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -631,6 +632,8 @@ app.post('/api/repositories', authenticateToken, async (req, res) => {
        VALUES ($1, 'main', true, $2)`,
       [newRepo.id, req.user.id]
     );
+
+
 
     // Emit real-time event
     io.emit('repositoryCreated', newRepo);
@@ -2568,110 +2571,316 @@ app.get('/api/users/status', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================== SSH KEY MANAGEMENT APIs ====================
+// ==================== REPOHUB ADVANCED FEATURES ====================
 
-// Get user's SSH keys
-app.get('/api/ssh-keys', authenticateToken, async (req, res) => {
+// Repository Settings
+app.get('/api/repositories/:id/settings', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT id, title, public_key, fingerprint, created_at, last_used_at FROM ssh_keys WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user.id]
+      `SELECT rs.* FROM repository_settings rs
+       JOIN repositories r ON rs.repository_id = r.id
+       WHERE r.id = $1 AND (r.owner_id = $2 OR r.id IN (
+         SELECT repository_id FROM repository_access WHERE user_id = $2
+       ))`,
+      [req.params.id, req.user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      // Create default settings if none exist
+      await db.query(
+        'INSERT INTO repository_settings (repository_id) VALUES ($1)',
+        [req.params.id]
+      );
+      const newResult = await db.query(
+        'SELECT * FROM repository_settings WHERE repository_id = $1',
+        [req.params.id]
+      );
+      return res.json(newResult.rows[0]);
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch repository settings' });
+  }
+});
+
+app.put('/api/repositories/:id/settings', authenticateToken, async (req, res) => {
+  try {
+    const { default_branch, allow_merge_commits, allow_squash_merge, allow_rebase_merge,
+            delete_head_branches, require_pull_request_reviews, required_approvers,
+            dismiss_stale_reviews, require_code_owner_reviews, require_status_checks,
+            require_branches_up_to_date, enforce_admins } = req.body;
+    
+    const result = await db.query(
+      `UPDATE repository_settings SET
+        default_branch = $1, allow_merge_commits = $2, allow_squash_merge = $3,
+        allow_rebase_merge = $4, delete_head_branches = $5, require_pull_request_reviews = $6,
+        required_approvers = $7, dismiss_stale_reviews = $8, require_code_owner_reviews = $9,
+        require_status_checks = $10, require_branches_up_to_date = $11, enforce_admins = $12,
+        updated_at = CURRENT_TIMESTAMP
+       WHERE repository_id = $13
+       RETURNING *`,
+      [default_branch, allow_merge_commits, allow_squash_merge, allow_rebase_merge,
+       delete_head_branches, require_pull_request_reviews, required_approvers,
+       dismiss_stale_reviews, require_code_owner_reviews, require_status_checks,
+       require_branches_up_to_date, enforce_admins, req.params.id]
+    );
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update repository settings' });
+  }
+});
+
+// CI/CD Pipelines
+app.get('/api/repositories/:id/pipelines', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT p.*, u.username as created_by_name
+       FROM pipelines p
+       JOIN users u ON p.created_by = u.id
+       WHERE p.repository_id = $1
+       ORDER BY p.created_at DESC`,
+      [req.params.id]
     );
     
     res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch SSH keys' });
+    res.status(500).json({ error: 'Failed to fetch pipelines' });
   }
 });
 
-// Add SSH key
-app.post('/api/ssh-keys', authenticateToken, async (req, res) => {
+app.post('/api/repositories/:id/pipelines', authenticateToken, async (req, res) => {
   try {
-    const { title, public_key } = req.body;
-    
-    // Validate SSH key format
-    if (!public_key.startsWith('ssh-rsa ') && !public_key.startsWith('ssh-ed25519 ') && !public_key.startsWith('ssh-dss ')) {
-      return res.status(400).json({ error: 'Invalid SSH key format' });
-    }
-    
-    // Generate fingerprint (simplified - in production, use proper SSH key fingerprinting)
-    const fingerprint = require('crypto')
-      .createHash('sha256')
-      .update(public_key)
-      .digest('hex')
-      .substring(0, 16);
-    
-    // Check if key already exists
-    const existingKey = await db.query(
-      'SELECT id FROM ssh_keys WHERE fingerprint = $1',
-      [fingerprint]
-    );
-    
-    if (existingKey.rows.length > 0) {
-      return res.status(400).json({ error: 'SSH key already exists' });
-    }
+    const { name, description, trigger_type, trigger_branch, yaml_config } = req.body;
     
     const result = await db.query(
-      'INSERT INTO ssh_keys (user_id, title, public_key, fingerprint) VALUES ($1, $2, $3, $4) RETURNING id, title, fingerprint, created_at',
-      [req.user.id, title, public_key, fingerprint]
+      `INSERT INTO pipelines (repository_id, name, description, trigger_type, trigger_branch, yaml_config, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [req.params.id, name, description, trigger_type, trigger_branch, yaml_config, req.user.id]
     );
     
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to add SSH key' });
+    res.status(500).json({ error: 'Failed to create pipeline' });
   }
 });
 
-// Delete SSH key
-app.delete('/api/ssh-keys/:id', authenticateToken, async (req, res) => {
+app.put('/api/pipelines/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, description, trigger_type, trigger_branch, yaml_config, is_active } = req.body;
+    
+    const result = await db.query(
+      `UPDATE pipelines SET
+        name = $1, description = $2, trigger_type = $3, trigger_branch = $4,
+        yaml_config = $5, is_active = $6, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7 AND created_by = $8
+       RETURNING *`,
+      [name, description, trigger_type, trigger_branch, yaml_config, is_active, req.params.id, req.user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pipeline not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update pipeline' });
+  }
+});
+
+app.delete('/api/pipelines/:id', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
-      'DELETE FROM ssh_keys WHERE id = $1 AND user_id = $2 RETURNING id',
+      'DELETE FROM pipelines WHERE id = $1 AND created_by = $2 RETURNING id',
       [req.params.id, req.user.id]
     );
     
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'SSH key not found' });
+      return res.status(404).json({ error: 'Pipeline not found' });
     }
     
     res.json({ success: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to delete SSH key' });
+    res.status(500).json({ error: 'Failed to delete pipeline' });
   }
 });
 
-// Get repository SSH clone URL
-app.get('/api/repositories/:id/ssh-url', authenticateToken, async (req, res) => {
+// Pipeline Runs
+app.get('/api/pipelines/:id/runs', authenticateToken, async (req, res) => {
   try {
-    // Check if user has access to repository
-    const accessCheck = await db.query(
-      `SELECT r.*, ra.access_type
-       FROM repositories r
-       LEFT JOIN repository_access ra ON r.id = ra.repository_id AND ra.user_id = $2
-       WHERE r.id = $1 AND (r.owner_id = $2 OR ra.user_id = $2 OR r.is_private = false)`,
-      [req.params.id, req.user.id]
+    const result = await db.query(
+      `SELECT pr.*, u.username as created_by_name
+       FROM pipeline_runs pr
+       JOIN users u ON pr.created_by = u.id
+       WHERE pr.pipeline_id = $1
+       ORDER BY pr.started_at DESC`,
+      [req.params.id]
     );
     
-    if (accessCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Repository not found or access denied' });
-    }
-    
-    const repository = accessCheck.rows[0];
-    const sshUrl = `ssh://git@localhost:2222/${repository.owner_name}/${repository.name}.git`;
-    
-    res.json({
-      ssh_url: sshUrl,
-      repository_name: repository.name,
-      owner_name: repository.owner_name
-    });
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to get SSH URL' });
+    res.status(500).json({ error: 'Failed to fetch pipeline runs' });
   }
 });
+
+app.post('/api/pipelines/:id/runs', authenticateToken, async (req, res) => {
+  try {
+    const { branch, commit_hash } = req.body;
+    
+    const result = await db.query(
+      `INSERT INTO pipeline_runs (pipeline_id, repository_id, branch, commit_hash, created_by)
+       VALUES ($1, (SELECT repository_id FROM pipelines WHERE id = $1), $2, $3, $4)
+       RETURNING *`,
+      [req.params.id, branch, commit_hash, req.user.id]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create pipeline run' });
+  }
+});
+
+// Repository Insights
+app.get('/api/repositories/:id/insights', authenticateToken, async (req, res) => {
+  try {
+    const { period = '30' } = req.query;
+    
+    const result = await db.query(
+      `SELECT * FROM repository_insights
+       WHERE repository_id = $1 AND date >= CURRENT_DATE - INTERVAL '${period} days'
+       ORDER BY date DESC`,
+      [req.params.id]
+    );
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch repository insights' });
+  }
+});
+
+// Repository Webhooks
+app.get('/api/repositories/:id/webhooks', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT w.*, u.username as created_by_name
+       FROM repository_webhooks w
+       JOIN users u ON w.created_by = u.id
+       WHERE w.repository_id = $1
+       ORDER BY w.created_at DESC`,
+      [req.params.id]
+    );
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch webhooks' });
+  }
+});
+
+app.post('/api/repositories/:id/webhooks', authenticateToken, async (req, res) => {
+  try {
+    const { url, events, secret } = req.body;
+    
+    const result = await db.query(
+      `INSERT INTO repository_webhooks (repository_id, url, events, secret, created_by)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [req.params.id, url, events, secret, req.user.id]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create webhook' });
+  }
+});
+
+// Repository Tags
+app.get('/api/repositories/:id/tags', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT t.*, u.username as created_by_name
+       FROM repository_tags t
+       JOIN users u ON t.created_by = u.id
+       WHERE t.repository_id = $1
+       ORDER BY t.created_at DESC`,
+      [req.params.id]
+    );
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch tags' });
+  }
+});
+
+app.post('/api/repositories/:id/tags', authenticateToken, async (req, res) => {
+  try {
+    const { name, description, commit_hash } = req.body;
+    
+    const result = await db.query(
+      `INSERT INTO repository_tags (repository_id, name, description, commit_hash, created_by)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [req.params.id, name, description, commit_hash, req.user.id]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create tag' });
+  }
+});
+
+// Repository Releases
+app.get('/api/repositories/:id/releases', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT r.*, u.username as created_by_name
+       FROM repository_releases r
+       JOIN users u ON r.created_by = u.id
+       WHERE r.repository_id = $1
+       ORDER BY r.created_at DESC`,
+      [req.params.id]
+    );
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch releases' });
+  }
+});
+
+app.post('/api/repositories/:id/releases', authenticateToken, async (req, res) => {
+  try {
+    const { tag_name, title, description, is_prerelease, is_draft } = req.body;
+    
+    const result = await db.query(
+      `INSERT INTO repository_releases (repository_id, tag_name, title, description, is_prerelease, is_draft, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [req.params.id, tag_name, title, description, is_prerelease, is_draft, req.user.id]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create release' });
+  }
+});
+
+
 
 // Socket.IO connection handler
 io.on('connection', (socket) => {
