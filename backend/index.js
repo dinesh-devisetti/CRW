@@ -11,7 +11,18 @@ const io = new Server(server, {
   },
 });
 
-app.use(express.json());
+// Middleware optimizations
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
 
 // Tasks CRUD REST APIs
 
